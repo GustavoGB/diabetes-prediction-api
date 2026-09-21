@@ -1,0 +1,168 @@
+# Column lists are frozen here on purpose. The notebook derived them from the
+# data at hand (`min() == 0`, cardinality thresholds), which silently produces a
+# different schema for a different batch.
+columns:
+  target: OUTCOME
+  raw_numerical:
+    - PREGNANCIES
+    - GLUCOSE
+    - BLOODPRESSURE
+    - SKINTHICKNESS
+    - INSULIN
+    - BMI
+    - DIABETESPEDIGREEFUNCTION
+    - AGE
+  # 0 means "not measured" on these five, never a real reading.
+  zero_as_missing: [GLUCOSE, BLOODPRESSURE, SKINTHICKNESS, INSULIN, BMI]
+  engineered_numerical: [NEW_GLUCOSE_INSULIN, NEW_GLUCOSE_PREGNANCIES]
+  engineered_categorical:
+    - NEW_AGE_CAT
+    - NEW_BMI
+    - NEW_GLUCOSE
+    - NEW_AGE_BMI_NOM
+    - NEW_AGE_GLUCOSE_NOM
+
+split:
+  test_size: 0.3
+  random_state: 17
+  stratify: true
+
+imputer:
+  n_neighbors: 5
+
+outliers:
+  q_low: 0.05
+  q_high: 0.95
+  factor: 1.5
+
+feature_engineering:
+  senior_age: 50
+  # Inner edges only: the nodes add -inf and +inf at both ends, as the bands
+  # below already did. Closed outer edges (the old [0, ..., 100] / [0, ..., 300])
+  # were narrower than the fitted Tukey fences — glucose caps at 333.6 but the
+  # top bin ended at 300 — so a legal value could fall out of pd.cut as NaN,
+  # stringify to "nan" and silently one-hot to all zeros.
+  bmi_bins: [18.5, 24.9, 29.9]
+  bmi_labels: [Underweight, Healthy, Overweight, Obese]
+  glucose_bins: [140, 200]
+  glucose_labels: [Normal, Prediabetes, Diabetes]
+  glucose_band_edges: [69, 99, 125]
+  glucose_band_labels: [low, normal, hidden, high]
+
+# Shared by both candidates so their contracts provably cannot drift.
+_model: &model
+  target_column: OUTCOME
+  train_splits: [train]
+  eval_splits: [train, test]
+
+baseline:
+  <<: *model
+  class_path: sklearn.linear_model.LogisticRegression
+  init_args: {random_state: 46, max_iter: 1000}
+
+# Swap `class_path` (e.g. sklearn.ensemble.HistGradientBoostingClassifier or
+# lightgbm.LGBMClassifier) and its grid to change the challenger — no code edit.
+tuning:
+  <<: *model
+  class_path: sklearn.ensemble.RandomForestClassifier
+  init_args: {random_state: 46}
+  cv: 5
+  scoring: roc_auc
+  param_grid:
+    n_estimators: [100, 200, 300]
+    max_depth: [null, 5, 10]
+    min_samples_split: [2, 5, 10]
+
+selection:
+  metric: roc_auc
+  split: test
+
+inference:
+  threshold: 0.5
+
+# ------------------------------------------------------------------ data quality
+# Great Expectations suites. Pydantic validates one request at the HTTP boundary;
+# these validate a whole batch at the pipeline boundary — row counts, null rates,
+# value ranges and class balance, which no single-row model can express.
+# Expectations whose column is absent are skipped, and table-level ones
+# (column_set) are narrowed to the columns present, so one suite guards both the
+# labelled modelling CSV and a genuinely unlabelled inference payload. Missing
+# *feature* columns are caught earlier and more clearly, by clean_data.
+data_quality:
+  # Applied to cleaned data on BOTH branches. Running the same suite over
+  # training and inference input is the drift check: the inference batch must
+  # look like the data the model was fitted on.
+  cleaned:
+    suite: cleaned_data
+    fail_on_error: true
+    expectations:
+      - type: ExpectTableRowCountToBeBetween
+        kwargs: {min_value: 20, max_value: 100000}
+      - type: ExpectTableColumnsToMatchSet
+        kwargs:
+          column_set: [PREGNANCIES, GLUCOSE, BLOODPRESSURE, SKINTHICKNESS,
+                       INSULIN, BMI, DIABETESPEDIGREEFUNCTION, AGE, OUTCOME]
+          exact_match: false
+      # Plausible physiological ranges. Sentinel zeros are already NaN by now,
+      # so a 0 here would mean the cleaning step silently stopped working.
+      - type: ExpectColumnValuesToBeBetween
+        kwargs: {column: PREGNANCIES, min_value: 0, max_value: 20}
+      - type: ExpectColumnValuesToBeBetween
+        kwargs: {column: GLUCOSE, min_value: 1, max_value: 300}
+      - type: ExpectColumnValuesToBeBetween
+        kwargs: {column: BLOODPRESSURE, min_value: 1, max_value: 200}
+      - type: ExpectColumnValuesToBeBetween
+        kwargs: {column: SKINTHICKNESS, min_value: 1, max_value: 110}
+      - type: ExpectColumnValuesToBeBetween
+        kwargs: {column: INSULIN, min_value: 1, max_value: 1000}
+      - type: ExpectColumnValuesToBeBetween
+        kwargs: {column: BMI, min_value: 1, max_value: 80}
+      - type: ExpectColumnValuesToBeBetween
+        kwargs: {column: AGE, min_value: 18, max_value: 120}
+      # Missingness budgets. Insulin is ~48% unmeasured in this dataset and that
+      # is expected; a jump past 60% means the source feed degraded.
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: GLUCOSE, mostly: 0.95}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: BMI, mostly: 0.95}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: BLOODPRESSURE, mostly: 0.90}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: INSULIN, mostly: 0.40}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: SKINTHICKNESS, mostly: 0.60}
+      # Target sanity, skipped automatically on unlabelled payloads.
+      - type: ExpectColumnValuesToBeInSet
+        kwargs: {column: OUTCOME, value_set: [0, 1]}
+      - type: ExpectColumnMeanToBeBetween
+        kwargs: {column: OUTCOME, min_value: 0.20, max_value: 0.50}
+
+  # Post-conditions of the whole data engineering pipeline.
+  master_table:
+    suite: master_table
+    fail_on_error: true
+    expectations:
+      - type: ExpectTableRowCountToBeBetween
+        kwargs: {min_value: 20, max_value: 100000}
+      # Imputation must have filled every gap: nothing reaches the model as NaN.
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: GLUCOSE}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: INSULIN}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: SKINTHICKNESS}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: BMI}
+      - type: ExpectColumnValuesToNotBeNull
+        kwargs: {column: BLOODPRESSURE}
+      - type: ExpectColumnValuesToBeInSet
+        kwargs: {column: SPLIT, value_set: [train, test]}
+      - type: ExpectColumnValuesToBeInSet
+        kwargs: {column: OUTCOME, value_set: [0, 1]}
+      # Stratification must have preserved the class balance.
+      - type: ExpectColumnMeanToBeBetween
+        kwargs: {column: OUTCOME, min_value: 0.20, max_value: 0.50}
+      # RobustScaler centres on the train median, so the column median lands
+      # near 0. A drift here means the scaler was refitted or bypassed.
+      - type: ExpectColumnMedianToBeBetween
+        kwargs: {column: GLUCOSE, min_value: -0.5, max_value: 0.5}
